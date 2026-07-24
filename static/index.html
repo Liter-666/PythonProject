@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="带短期状态、长期记忆与语义搜索的 LangChain Agent 对话台" />
+    <title>Agent Memory Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <!-- 整体采用左侧运行状态栏 + 右侧聊天工作区布局。 -->
+    <div class="app-shell">
+      <!-- 侧栏：用户身份、thread_id、CustomState 和记忆组件状态。 -->
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">AM</div>
+          <div>
+            <strong>Agent Memory</strong>
+            <span>对话与记忆控制台</span>
+          </div>
+        </div>
+
+        <!-- 用户 ID 决定长期 Store 的 namespace；thread_id 决定短期 checkpoint。 -->
+        <section class="panel identity-panel">
+          <div class="section-label">运行身份</div>
+          <label for="user-id">用户 ID</label>
+          <input id="user-id" value="demo-user" autocomplete="off" />
+          <label for="thread-id">会话 Thread ID</label>
+          <div class="field-row">
+            <input id="thread-id" autocomplete="off" />
+            <button id="new-thread" class="icon-button" title="新建会话" aria-label="新建会话">＋</button>
+          </div>
+          <p class="field-help">相同用户可跨会话读取 Store；相同 Thread 会延续短期状态。</p>
+        </section>
+
+        <!-- 该面板的数据由 /api/chat 和 /api/state 返回后动态更新。 -->
+        <section class="panel state-panel">
+          <div class="section-label">CustomState</div>
+          <div class="metric-grid">
+            <div class="metric">
+              <span>更新次数</span>
+              <strong id="model-count">0</strong>
+            </div>
+            <div class="metric">
+              <span>消息数量</span>
+              <strong id="message-count">0</strong>
+            </div>
+          </div>
+          <div class="session-time">
+            <span>会话开始</span>
+            <strong id="session-start">尚未开始</strong>
+          </div>
+        </section>
+
+        <!-- 展示当前示例中三类记忆/检索组件的职责。 -->
+        <section class="memory-map">
+          <div class="memory-row">
+            <span class="memory-dot short"></span>
+            <div><strong>短期状态</strong><small>InMemorySaver · Thread 级</small></div>
+          </div>
+          <div class="memory-row">
+            <span class="memory-dot long"></span>
+            <div><strong>长期记忆</strong><small>InMemoryStore · User 级</small></div>
+          </div>
+          <div class="memory-row">
+            <span class="memory-dot vector"></span>
+            <div><strong>语义索引</strong><small id="embedding-label">正在检测 · 1024维</small></div>
+          </div>
+        </section>
+      </aside>
+
+      <!-- 主区域：服务状态、消息历史和输入组件。 -->
+      <main class="chat-workspace">
+        <header class="topbar">
+          <div>
+            <span class="eyebrow">LANGCHAIN AGENT</span>
+            <h1>企业信息助手</h1>
+          </div>
+          <div id="connection" class="connection"><span></span>正在连接</div>
+        </header>
+
+        <!-- aria-live 让辅助技术能够感知动态加入的新消息。 -->
+        <section id="messages" class="messages" aria-live="polite">
+          <div class="welcome-card">
+            <div class="welcome-kicker">READY</div>
+            <h2>一个能记住、能检索的 Agent</h2>
+            <p>它会通过 ToolRuntime 读取运行现场，用 Command 更新会话状态，并在 Store 中查询或保存跨会话信息。</p>
+            <div class="capabilities">
+              <span>精确查询</span><span>语义搜索</span><span>长期偏好</span><span>会话状态</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 快捷提示和消息输入框；实际请求逻辑位于 app.js。 -->
+        <section class="composer-wrap">
+          <div class="quick-actions" aria-label="快捷提问">
+            <button data-prompt="帮我查询 user_001 的信息">查询 user_001</button>
+            <button data-prompt="帮我找技术部门的用户">语义搜索技术部</button>
+            <button data-prompt="记住我喜欢简短、直接的回答">保存回答偏好</button>
+            <button data-prompt="我的长期回答偏好是什么？">读取长期偏好</button>
+          </div>
+          <form id="composer" class="composer">
+            <textarea id="message-input" rows="1" maxlength="4000" placeholder="输入消息，Enter 发送，Shift + Enter 换行" aria-label="聊天消息"></textarea>
+            <button id="send-button" type="submit">发送 <span>↗</span></button>
+          </form>
+          <p class="composer-note">模型可能产生 API 与 Embedding 调用费用 · 本地内存会在服务停止后清空</p>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
