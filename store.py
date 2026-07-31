@@ -3,21 +3,25 @@
 # Python 标准库：环境变量、哈希、数学计算、文本切分和控制台输出。
 import os
 import hashlib
+import json
 import math
 import re
 import sys
+import threading
 from dataclasses import dataclass
+from http import HTTPStatus
+from typing import Any
 
 # 第三方库：配置加载、LangChain Agent/工具/模型，以及 LangGraph 记忆组件。
+from dashscope import TextEmbedding
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.embeddings import Embeddings
 from langchain.messages import HumanMessage
 from langchain.tools import ToolRuntime, tool
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.store.memory import InMemoryStore
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.store.base import BaseStore
 
 from state import CustomState, update_state
 
@@ -113,7 +117,115 @@ class LocalHashEmbeddings(Embeddings):
         return self._embed(text)
 
 
-def _seed_store(store: InMemoryStore) -> None:
+class DashScopeTextEmbeddings(Embeddings):
+    """把阿里云官方 TextEmbedding SDK 适配为 LangChain Embeddings 接口。"""
+
+    def __init__(self, api_key: str, dimensions: int = 1024):
+        """保存调用凭据和固定输出维度，不在代码或日志中输出密钥。"""
+
+        self.api_key = api_key
+        self.dimensions = dimensions
+
+    def _embed(self, texts: list[str], *, text_type: str) -> list[list[float]]:
+        """批量调用 text-embedding-v4，并按输入下标恢复结果顺序。"""
+
+        response = TextEmbedding.call(
+            model="text-embedding-v4",
+            input=texts,
+            api_key=self.api_key,
+            text_type=text_type,
+            dimension=self.dimensions,
+            output_type="dense",
+        )
+        if response.status_code != HTTPStatus.OK:
+            raise RuntimeError(
+                f"DashScope Embedding 调用失败：{response.code} {response.message}"
+            )
+
+        # 服务端返回 text_index，排序后才能确保向量和原始文本一一对应。
+        embeddings = sorted(
+            response.output["embeddings"],
+            key=lambda item: item["text_index"],
+        )
+        vectors = [item["embedding"] for item in embeddings]
+        if len(vectors) != len(texts) or any(
+            len(vector) != self.dimensions for vector in vectors
+        ):
+            raise RuntimeError("DashScope Embedding 返回的向量数量或维度不符合预期")
+        return vectors
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """把待检索文档转换为向量。"""
+
+        return self._embed(texts, text_type="document")
+
+    def embed_query(self, text: str) -> list[float]:
+        """把搜索请求转换为查询向量。"""
+
+        return self._embed([text], text_type="query")[0]
+
+
+class FallbackEmbeddings(Embeddings):
+    """优先使用远程 Embedding，调用失败后在当前进程内永久切换到本地后备。"""
+
+    def __init__(
+        self,
+        primary: Embeddings,
+        fallback: Embeddings,
+        *,
+        primary_name: str,
+        fallback_name: str,
+    ):
+        """保存主后端和后备后端，并初始化线程安全的切换状态。"""
+
+        self.primary = primary
+        self.fallback = fallback
+        self.primary_name = primary_name
+        self.fallback_name = fallback_name
+        self._fallback_active = False
+        self._switch_lock = threading.Lock()
+
+    @property
+    def backend_name(self) -> str:
+        """返回当前进程实际使用的 Embedding 后端名称。"""
+
+        return self.fallback_name if self._fallback_active else self.primary_name
+
+    def _activate_fallback(self, exc: Exception) -> None:
+        """首次失败时原子切换到本地后备，并记录不含密钥的失败原因。"""
+
+        with self._switch_lock:
+            if not self._fallback_active:
+                print(
+                    f"DashScope Embedding 不可用，切换到本地哈希：{exc}",
+                    file=sys.stderr,
+                )
+                self._fallback_active = True
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """优先调用远程文档向量；失败后使用本地向量并保持后备状态。"""
+
+        if self._fallback_active:
+            return self.fallback.embed_documents(texts)
+        try:
+            return self.primary.embed_documents(texts)
+        except Exception as exc:
+            self._activate_fallback(exc)
+            return self.fallback.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        """优先调用远程查询向量；失败后使用本地向量并保持后备状态。"""
+
+        if self._fallback_active:
+            return self.fallback.embed_query(text)
+        try:
+            return self.primary.embed_query(text)
+        except Exception as exc:
+            self._activate_fallback(exc)
+            return self.fallback.embed_query(text)
+
+
+def seed_store(store: BaseStore) -> None:
     """把 SEED_USERS 中的演示资料写入 users namespace。"""
 
     for user_id, user_info in SEED_USERS.items():
@@ -122,65 +234,73 @@ def _seed_store(store: InMemoryStore) -> None:
         store.put(("users",), user_id, user_info)
 
 
-def create_memory_store() -> tuple[InMemoryStore, str]:
-    """创建语义 Store，并返回 Store 对象和实际使用的向量后端名称。"""
+def create_embedding_model() -> tuple[Embeddings, str]:
+    """创建 DashScope 优先、本地哈希兜底的 Embedding。"""
 
-    # 没有环境变量时返回 None；存在时返回 Key 字符串。
-    dashscope_key = os.getenv("DASHSCOPE_API_KEY")
-
-    # 当前逻辑是：只要存在 DashScope Key，就优先尝试 text-embedding-v4。
-    if  dashscope_key:
-        try:
-            # 创建阿里云 DashScope 的 Embedding 客户端。
-            dashscope_embeddings = DashScopeEmbeddings(
-                model="text-embedding-v4",
-                dashscope_api_key=dashscope_key,
-            )
-            # $ 表示把每条 Store value 的整个 JSON 文档参与向量化。
-            store = InMemoryStore(
-                index={
-                    "embed": dashscope_embeddings,
-                    "dims": 1024,
-                    "fields": ["$"],
-                }
-            )
-            # put 数据时会真正请求 DashScope，因此也顺便验证 Key 和网络是否有效。
-            _seed_store(store)
-
-            # 第二个返回值供健康接口和前端显示当前实际使用的后端。
-            return store, "text-embedding-v4"
-        except Exception as exc:
-            # 云端向量不可用时记录原因，但不终止整个聊天应用。
-            print(
-                f"DashScope embeddings unavailable; using local fallback: {exc}",
-                file=sys.stderr,
-            )
-
-    # 没有 Key 或云端调用失败时，创建无需联网的本地哈希向量后备。
+    provider = os.getenv("EMBEDDING_PROVIDER", "dashscope").strip().lower()
     local_embeddings = LocalHashEmbeddings(dimensions=1024)
 
-    # 两个分支使用完全相同的 Store 接口，后续工具不需要关心具体向量提供方。
-    store = InMemoryStore(
-        index={
-            "embed": local_embeddings,
-            "dims": 1024,
-            "fields": ["$"],
-        }
+    if provider == "dashscope":
+        dashscope_key = os.getenv("DASHSCOPE_API_KEY")
+        if not dashscope_key:
+            print(
+                "未配置 DASHSCOPE_API_KEY，使用本地哈希 Embedding",
+                file=sys.stderr,
+            )
+            return local_embeddings, "local-hash-1024-fallback"
+
+        embeddings = FallbackEmbeddings(
+            DashScopeTextEmbeddings(api_key=dashscope_key, dimensions=1024),
+            local_embeddings,
+            primary_name="text-embedding-v4",
+            fallback_name="local-hash-1024-fallback",
+        )
+        # 启动时执行一次最小查询，确保健康接口显示的是实际可用后端。
+        embeddings.embed_query("连接测试")
+        return embeddings, embeddings.backend_name
+
+    if provider == "local":
+        return local_embeddings, "local-hash-1024"
+
+    raise RuntimeError(
+        f"不支持的 EMBEDDING_PROVIDER={provider!r}，只能使用 local 或 dashscope"
     )
-    # 使用本地算法为演示数据建立索引，不会产生外部 API 费用。
-    _seed_store(store)
-    return store, "local-hash-1024"
 
 
-# 模块加载时创建一份共享 Store；Agent 和 FastAPI 都引用同一个实例。
-memory_store, embedding_backend = create_memory_store()
+# Embedding 客户端本身不保存长期数据；真正的用户资料和偏好由 PostgreSQL Store 保存。
+embedding_model, embedding_backend = create_embedding_model()
+
+
+def get_embedding_backend() -> str:
+    """返回当前实际后端，包含运行期间发生的自动降级。"""
+
+    if isinstance(embedding_model, FallbackEmbeddings):
+        return embedding_model.backend_name
+    return embedding_backend
+
+
+def _store_value_text(value: dict[str, Any]) -> str:
+    """把 Store 中的 JSON 值稳定转换为参与相似度计算的文本。"""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    """计算两个向量的余弦相似度，并处理零向量。"""
+
+    numerator = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return numerator / (left_norm * right_norm)
 
 
 @tool
 def get_user_info(user_id: str, runtime: ToolRuntime[AppContext, CustomState]) -> str:
     """根据准确的用户 ID 查询用户资料。"""
 
-    # 只有 create_agent(..., store=memory_store) 后 runtime.store 才不为 None。
+    # 只有 create_agent(..., store=postgres_store) 后 runtime.store 才不为 None。
     if runtime.store is None:
         return "Store not available"
 
@@ -200,13 +320,25 @@ def search_users(query: str, runtime: ToolRuntime[AppContext, CustomState]) -> s
     if runtime.store is None:
         return "Store not available"
 
-    # search 会先把 query 转成向量，再返回 users namespace 中最相似的 3 条数据。
-    results = runtime.store.search(("users",), query=query, limit=3)
-    if not results:
+    # 当前 PostgreSQL 尚未安装 pgvector，因此先读取少量演示数据，再显式计算相似度。
+    # 该实现用于暴露检索机制和建立测试基线，不适合数据量较大的生产检索。
+    items = runtime.store.search(("users",), limit=100)
+    if not items:
         return "没有找到匹配的用户"
 
-    # search 返回 Item 列表，因此需要遍历并读取每个 item.value。
-    return "\n".join(f"用户信息：{item.value}" for item in results)
+    query_vector = embedding_model.embed_query(query)
+    document_vectors = embedding_model.embed_documents(
+        [_store_value_text(item.value) for item in items]
+    )
+    ranked_items = sorted(
+        zip(items, document_vectors, strict=True),
+        key=lambda pair: _cosine_similarity(query_vector, pair[1]),
+        reverse=True,
+    )
+
+    return "\n".join(
+        f"用户信息：{item.value}" for item, _ in ranked_items[:3]
+    )
 
 
 @tool
@@ -255,47 +387,57 @@ model = ChatOpenAI(
     base_url="https://api.deepseek.com",
 )
 
-# Checkpointer 保存每个 thread 的短期消息和 CustomState；程序退出后内存数据消失。
-checkpointer = InMemorySaver()
+def create_app_agent(
+    checkpointer: BaseCheckpointSaver,
+    store: BaseStore,
+):
+    """使用由应用管理生命周期的 Checkpointer 和 Store 创建 Agent。"""
 
-# 把模型、全部工具、状态结构、上下文、短期记忆和长期 Store 组装成一个 Agent。
-agent = create_agent(
-    model=model,
-    tools=[
-        # 每轮更新 CustomState。
-        update_state,
-        # 精确用户查询与语义用户搜索。
-        get_user_info,
-        search_users,
-        # 跨 thread 保存和读取当前用户的长期偏好。
-        save_preference,
-        get_preference,
-    ],
-    state_schema=CustomState,  # 定义 messages、计数和会话开始时间。
-    context_schema=AppContext,  # 定义 runtime.context 的结构。
-    checkpointer=checkpointer,  # 保存 thread 级短期状态。
-    store=memory_store,  # 提供跨 thread 的长期数据和语义索引。
-    system_prompt=(
-        "你是企业信息助手。每轮请求必须先调用 update_state 更新会话状态。"
-        "遇到明确用户 ID 时使用 get_user_info；按姓名、部门或描述查找时使用 "
-        "search_users；用户要求记住回答偏好时使用 save_preference；询问长期偏好时使用 "
-        "get_preference。不要编造工具没有返回的数据。"
-    ),
-)
+    # Agent 只依赖抽象接口，不需要知道底层连接的是 PostgreSQL 还是测试替身。
+    return create_agent(
+        model=model,
+        tools=[
+            # 每轮更新 CustomState。
+            update_state,
+            # 精确用户查询与语义用户搜索。
+            get_user_info,
+            search_users,
+            # 跨 thread 保存和读取当前用户的长期偏好。
+            save_preference,
+            get_preference,
+        ],
+        state_schema=CustomState,  # 定义 messages、计数和会话开始时间。
+        context_schema=AppContext,  # 定义 runtime.context 的结构。
+        checkpointer=checkpointer,  # 保存 thread 级短期状态。
+        store=store,  # 提供跨 thread 的长期数据。
+        system_prompt=(
+            "你是企业信息助手。每轮请求必须先调用 update_state 更新会话状态。"
+            "遇到明确用户 ID 时使用 get_user_info；按姓名、部门或描述查找时使用 "
+            "search_users；用户要求记住回答偏好时使用 save_preference；询问长期偏好时使用 "
+            "get_preference。不要编造工具没有返回的数据。"
+        ),
+    )
 
 
-# 直接运行 store.py 时执行命令行演示；被 app.py 导入时只创建并导出 Agent。
+# 直接运行 store.py 时执行命令行演示；被 app.py 导入时只导出 Agent 工厂和工具。
 if __name__ == "__main__":
+    from persistence import open_postgres_resources
+
     # 同一个 thread_id 会继续使用该会话之前的 checkpoint。
     demo_config = {"configurable": {"thread_id": "store-demo"}}
 
-    # AppContext 提供可信 user_id，工具可通过 runtime.context.user_id 读取。
-    response = agent.invoke(
-        {"messages": [HumanMessage(content="帮我查询 user_001 的信息")]},
-        demo_config,
-        context=AppContext(user_id="demo-user"),
-    )
+    # 资源在整个 Agent 调用期间保持打开，退出 with 后由驱动可靠关闭连接。
+    with open_postgres_resources() as (checkpointer, postgres_store):
+        seed_store(postgres_store)
+        agent = create_app_agent(checkpointer, postgres_store)
 
-    # 打印完整消息链，包含用户消息、工具调用、工具结果和最终回答。
-    for message in response["messages"]:
-        message.pretty_print()
+        # AppContext 提供可信 user_id，工具可通过 runtime.context.user_id 读取。
+        response = agent.invoke(
+            {"messages": [HumanMessage(content="帮我查询 user_001 的信息")]},
+            demo_config,
+            context=AppContext(user_id="demo-user"),
+        )
+
+        # 打印完整消息链，包含用户消息、工具调用、工具结果和最终回答。
+        for message in response["messages"]:
+            message.pretty_print()

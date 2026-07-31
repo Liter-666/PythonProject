@@ -12,7 +12,9 @@
 - `app.py`：FastAPI 接口、Agent 调用入口和消息序列化。
 - `state.py`：自定义 Agent State、`Command` 状态更新和最小短期记忆示例。
 - `store.py`：模型、工具、短期 Checkpointer、长期 Store 和 Embedding 的组装。
+- `persistence.py`：PostgreSQL Checkpointer、Store、数据库迁移和会话登记。
 - `static/`：用于观察对话、工具调用和状态变化的原生前端。
+- `tests/`：确定性逻辑和 PostgreSQL 持久化集成测试。
 - `test.py`：早期模型直连实验，不作为正式自动化测试入口。
 - 维持当前扁平结构，直到出现至少两个边界清晰的领域模块；需要拆目录时，先在 `README.md` 记录新结构及职责，再迁移代码。
 
@@ -23,18 +25,23 @@
 - LLM 调用：通过 OpenAI 兼容接口连接 DeepSeek。
 - Agent 工具调用：实现精确查询、语义搜索、长期偏好读写和状态更新工具。
 - Agent 状态：使用 `CustomState`、`ToolRuntime` 与 `Command`。
-- 短期记忆：使用 `InMemorySaver` 按 `thread_id` 保存消息和状态。
-- 长期记忆：使用 `InMemoryStore` 按 `user_id` namespace 隔离跨会话偏好。
-- Embedding/检索：支持 DashScope Embedding，并提供本地哈希向量后备方案。
+- 短期记忆：使用 `PostgresSaver` 按 `thread_id` 持久化消息和状态。
+- 长期记忆：使用 `PostgresStore` 按 `user_id` namespace 持久化跨会话偏好。
+- Embedding/检索：默认使用 DashScope `text-embedding-v4`，连接或运行调用失败后在
+  当前进程内切换到本地哈希；未安装 `pgvector` 前由应用层对少量 Store 数据计算相似度。
 - 应用集成：FastAPI API 与前端能够展示普通消息、工具调用、工具结果和状态摘要。
+- 持久化验证：已有 Checkpointer/Store 跨连接恢复和 thread 用户归属隔离集成测试。
 
 当前实现的已知边界：
 
-- Checkpointer 和 Store 都是进程内实现，重启后数据丢失，不能代表生产级持久化。
+- Checkpointer 和 Store 已迁移到 PostgreSQL，但尚未验证连接池并发、跨资源事务、
+  故障恢复、最小权限、数据过期和生产迁移。
 - 本地 `LocalHashEmbeddings` 适合演示接口和检索流程，不是语义模型，不能用来证明真实 Embedding/RAG 效果。
+- PostgreSQL 尚未安装 `pgvector`；当前应用层全量相似度计算只适合少量演示数据。
 - `model_call_count` 当前实际统计的是 `update_state` 工具更新次数，不是底层模型请求次数。
-- `README.md` 和 `.env.example` 声明了 `EMBEDDING_PROVIDER`，但 `store.py` 当前只依据 `DASHSCOPE_API_KEY` 是否存在来选后端；修改 Embedding 配置前先统一这一语义。
-- 项目目前没有正式自动化测试、离线评测集、线上评测、Tracing 或质量基线。
+- 项目已有 5 个 PostgreSQL/API 集成测试和 1 个本地检索单元测试，但还没有工具
+  纯逻辑/API 失败路径的完整测试、模型 fake/stub、离线评测集、线上评测、Tracing
+  或质量基线。
 
 ## AI 能力缺口与优先级
 
@@ -90,9 +97,6 @@
 
 若用户没有指定新的学习主题，优先推进 M1：
 
-1. 先统一 `EMBEDDING_PROVIDER` 的配置语义。
-2. 建立正式的 `tests/` 结构与模型 fake/stub 约定；这是新目录，实施前先把结构补充到 `README.md`。
-3. 为工具、用户/会话隔离和 API 失败路径补测试。
-4. 增加一个结构化输出实验。
-5. 建立首版固定评测数据集和可重复执行的评测脚本。
-
+1. 建立模型 fake/stub 约定，为工具纯逻辑、API 参数校验和失败路径补测试。
+2. 增加一个结构化输出实验。
+3. 建立首版固定评测数据集和可重复执行的评测脚本。

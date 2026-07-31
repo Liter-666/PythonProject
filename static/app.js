@@ -13,14 +13,21 @@ const sessionStart = document.querySelector("#session-start");
 // busy 用于阻止模型响应期间重复提交消息。
 let busy = false;
 
+// 浏览器只记住当前选择的身份和会话；真正的消息与状态仍保存在 PostgreSQL。
+const USER_ID_STORAGE_KEY = "agent-memory.user-id";
+const THREAD_ID_STORAGE_KEY = "agent-memory.thread-id";
+
 // 为新会话生成独立的 thread_id；旧浏览器没有 randomUUID 时使用时间戳后备。
 function createThreadId() {
   const id = crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Date.now().toString(36);
   return `chat-${id}`;
 }
 
-// 页面第一次打开时自动创建一个新会话。
-threadIdInput.value = createThreadId();
+// 页面刷新时恢复上次选择；只有浏览器从未保存过 thread_id 时才创建新会话。
+userIdInput.value = localStorage.getItem(USER_ID_STORAGE_KEY) || userIdInput.value;
+threadIdInput.value = localStorage.getItem(THREAD_ID_STORAGE_KEY) || createThreadId();
+localStorage.setItem(USER_ID_STORAGE_KEY, userIdInput.value);
+localStorage.setItem(THREAD_ID_STORAGE_KEY, threadIdInput.value);
 
 // 转义模型或工具返回的 HTML 特殊字符，防止内容被浏览器当成标签执行。
 function escapeHtml(value) {
@@ -166,19 +173,41 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
 // 新建 thread 只清空短期对话；相同 user_id 的 Store 长期偏好仍然存在。
 document.querySelector("#new-thread").addEventListener("click", () => {
   threadIdInput.value = createThreadId();
+  localStorage.setItem(THREAD_ID_STORAGE_KEY, threadIdInput.value);
   messages.innerHTML = "";
   updateState();
   addMessage("assistant", "新会话已经建立。短期状态已清空，但当前用户的长期偏好仍可从 Store 读取。");
 });
 
-// 用户手动修改 thread_id 时，从后端读取该会话已有的状态摘要。
-threadIdInput.addEventListener("change", async () => {
+// 从后端读取当前用户拥有的会话状态；user_id 同时参与服务端归属校验。
+async function loadThreadState() {
   try {
-    const response = await fetch(`/api/state?thread_id=${encodeURIComponent(threadIdInput.value.trim())}`);
-    updateState(await response.json());
+    const threadId = threadIdInput.value.trim();
+    const userId = userIdInput.value.trim();
+    if (!threadId || !userId) {
+      updateState();
+      return;
+    }
+
+    const query = new URLSearchParams({ thread_id: threadId, user_id: userId });
+    const response = await fetch(`/api/state?${query.toString()}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "读取会话状态失败");
+    updateState(data);
   } catch (_) {
     updateState();
   }
+}
+
+// 用户手动修改标识后更新浏览器选择，并尝试恢复对应的服务端状态。
+threadIdInput.addEventListener("change", () => {
+  localStorage.setItem(THREAD_ID_STORAGE_KEY, threadIdInput.value.trim());
+  loadThreadState();
+});
+
+userIdInput.addEventListener("change", () => {
+  localStorage.setItem(USER_ID_STORAGE_KEY, userIdInput.value.trim());
+  loadThreadState();
 });
 
 // 页面加载完成后检查后端，并显示当前实际使用的 Embedding 后端。
@@ -194,3 +223,6 @@ fetch("/api/health")
     connection.classList.add("error");
     connection.innerHTML = "<span></span>服务离线";
   });
+
+// 健康检查与状态恢复互不依赖，后端可用时会显示上次会话的状态摘要。
+loadThreadState();

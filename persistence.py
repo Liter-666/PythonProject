@@ -1,4 +1,4 @@
-"""基于 MySQL 的检查点持久化与应用会话登记。"""
+"""基于 PostgreSQL 的检查点、长期 Store 与应用会话登记。"""
 
 from __future__ import annotations
 
@@ -7,114 +7,136 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
-import pymysql
 from dotenv import load_dotenv
-from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
-from pymysql.connections import Connection
-from pymysql.cursors import DictCursor
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+from psycopg import Connection, connect
+from psycopg.rows import dict_row
 
 
-# 在读取 MYSQL_CHECKPOINT_URI 前加载本地开发环境配置。
+# 在读取 POSTGRES_URI 前加载本地开发环境配置。
 load_dotenv()
 
-MYSQL_CHECKPOINT_URI_ENV = "MYSQL_CHECKPOINT_URI"
+# 官方包建议限制 Checkpointer 允许反序列化的模块；显式环境变量仍可覆盖该安全默认值。
+os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
-# 检查点相关表由 LangGraph 管理；本表只保存应用层的会话归属和展示信息，
-# 避免业务代码直接查询或解析 LangGraph 的检查点二进制数据。
+POSTGRES_URI_ENV = "POSTGRES_URI"
+
+# Checkpointer 和 Store 的内部表由 LangGraph 管理；本表只保存应用层会话归属和展示信息，
+# 避免业务代码直接查询或解析框架内部数据。
 CHAT_THREADS_DDL = """
 CREATE TABLE IF NOT EXISTS chat_threads (
     thread_id VARCHAR(128) NOT NULL,
     user_id VARCHAR(128) NOT NULL,
     title VARCHAR(255) NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'active',
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        ON UPDATE CURRENT_TIMESTAMP(6),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (thread_id),
-    INDEX idx_chat_threads_user_updated (user_id, updated_at)
-) ENGINE=InnoDB
-  DEFAULT CHARSET=utf8mb4
-  COLLATE=utf8mb4_unicode_ci
+    CONSTRAINT ck_chat_threads_status
+        CHECK (status IN ('active', 'archived'))
+)
+"""
+
+CHAT_THREADS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_chat_threads_user_updated
+ON chat_threads (user_id, updated_at DESC)
 """
 
 
 class PersistenceConfigurationError(RuntimeError):
-    """MySQL 持久化配置缺失或格式错误。"""
+    """PostgreSQL 持久化配置缺失或格式错误。"""
 
 
 class ThreadOwnershipError(PermissionError):
     """用户尝试访问不属于自己的会话。"""
 
 
-def get_mysql_checkpoint_uri(uri: str | None = None) -> str:
-    """优先返回显式传入的 URI，否则读取 MySQL 检查点连接配置。"""
+def get_postgres_uri(uri: str | None = None) -> str:
+    """优先返回显式传入的 URI，否则读取 PostgreSQL 连接配置。"""
 
-    resolved_uri = uri or os.getenv(MYSQL_CHECKPOINT_URI_ENV)
+    resolved_uri = uri or os.getenv(POSTGRES_URI_ENV)
     if not resolved_uri:
         raise PersistenceConfigurationError(
-            f"{MYSQL_CHECKPOINT_URI_ENV} is required for MySQL persistence"
+            f"缺少 {POSTGRES_URI_ENV}，无法启用 PostgreSQL 持久化"
+        )
+
+    parsed = urlparse(resolved_uri)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise PersistenceConfigurationError(
+            f"{POSTGRES_URI_ENV} 必须使用 postgres:// 或 postgresql://"
+        )
+    if not parsed.hostname or not parsed.username or not parsed.path.strip("/"):
+        raise PersistenceConfigurationError(
+            f"{POSTGRES_URI_ENV} 必须包含主机、用户和数据库名"
         )
     return resolved_uri
 
 
-def _connection_kwargs(uri: str) -> dict[str, Any]:
-    """将 mysql:// URI 转换为 PyMySQL 所需的显式连接参数。"""
-
-    parsed = urlparse(uri)
-    if parsed.scheme != "mysql":
-        raise PersistenceConfigurationError(
-            f"{MYSQL_CHECKPOINT_URI_ENV} must use the mysql:// scheme"
-        )
-    if not parsed.hostname or not parsed.username or not parsed.path.strip("/"):
-        raise PersistenceConfigurationError(
-            f"{MYSQL_CHECKPOINT_URI_ENV} must include host, user and database"
-        )
-
-    return {
-        "host": parsed.hostname,
-        "port": parsed.port or 3306,
-        "user": unquote(parsed.username),
-        "password": unquote(parsed.password or ""),
-        "database": unquote(parsed.path.lstrip("/")),
-        "charset": "utf8mb4",
-        "autocommit": True,
-        "cursorclass": DictCursor,
-    }
-
-
-def connect_application_database(uri: str | None = None) -> Connection:
+def connect_application_database(
+    uri: str | None = None,
+) -> Connection[dict[str, Any]]:
     """为应用自行管理的会话元数据创建短生命周期数据库连接。"""
 
-    resolved_uri = get_mysql_checkpoint_uri(uri)
-    return pymysql.connect(**_connection_kwargs(resolved_uri))
+    resolved_uri = get_postgres_uri(uri)
+    # autocommit 避免只执行一次元数据语句时遗留未提交事务；dict_row 让业务代码按列名读取。
+    return connect(resolved_uri, autocommit=True, row_factory=dict_row)
 
 
 @contextmanager
-def open_mysql_checkpointer(
+def open_postgres_checkpointer(
     uri: str | None = None,
-) -> Iterator[PyMySQLSaver]:
-    """在 Agent 生命周期内保持 MySQL Checkpointer 连接可用。"""
+) -> Iterator[PostgresSaver]:
+    """在 Agent 生命周期内保持 PostgreSQL Checkpointer 连接可用。"""
 
-    resolved_uri = get_mysql_checkpoint_uri(uri)
-    with PyMySQLSaver.from_conn_string(resolved_uri) as checkpointer:
+    resolved_uri = get_postgres_uri(uri)
+    with PostgresSaver.from_conn_string(resolved_uri) as checkpointer:
         yield checkpointer
 
 
+@contextmanager
+def open_postgres_store(
+    uri: str | None = None,
+) -> Iterator[PostgresStore]:
+    """在 Agent 生命周期内保持 PostgreSQL 长期 Store 连接可用。"""
+
+    resolved_uri = get_postgres_uri(uri)
+    # 当前不传 index 配置，因此只创建持久化 JSON Store；M2 安装 pgvector 后再启用数据库向量索引。
+    with PostgresStore.from_conn_string(resolved_uri) as store:
+        yield store
+
+
+@contextmanager
+def open_postgres_resources(
+    uri: str | None = None,
+) -> Iterator[tuple[PostgresSaver, PostgresStore]]:
+    """同时打开 Agent 所需的短期 Checkpointer 与长期 Store。"""
+
+    resolved_uri = get_postgres_uri(uri)
+    # 两个对象各持有一条连接；即使共用数据库，它们也分别实现不同的 LangGraph 接口。
+    with (
+        open_postgres_checkpointer(resolved_uri) as checkpointer,
+        open_postgres_store(resolved_uri) as store,
+    ):
+        yield checkpointer, store
+
+
 def setup_database(uri: str | None = None) -> None:
-    """创建或升级检查点表，并创建应用自己的会话登记表。"""
+    """创建或升级 Checkpointer、Store 和应用会话登记表。"""
 
-    resolved_uri = get_mysql_checkpoint_uri(uri)
+    resolved_uri = get_postgres_uri(uri)
 
-    # setup() 是 Checkpointer 包提供的迁移入口；应用代码不应复制或修改
-    # 它所管理的四张内部表结构，防止框架升级时出现表结构不一致。
-    with open_mysql_checkpointer(resolved_uri) as checkpointer:
+    # 两个 setup() 都是官方包的迁移入口；应用不能复制其内部表定义，否则框架升级时会失配。
+    with open_postgres_resources(resolved_uri) as (checkpointer, store):
         checkpointer.setup()
+        store.setup()
 
     with connect_application_database(resolved_uri) as connection:
         with connection.cursor() as cursor:
             cursor.execute(CHAT_THREADS_DDL)
+            cursor.execute(CHAT_THREADS_INDEX_DDL)
 
 
 def ensure_thread_owner(
@@ -128,12 +150,13 @@ def ensure_thread_owner(
 
     with connect_application_database(uri) as connection:
         with connection.cursor() as cursor:
-            # INSERT IGNORE 让并发提交的首条消息具备幂等性；插入后仍必须查询
+            # ON CONFLICT DO NOTHING 让并发提交的首条消息具备幂等性；插入后仍查询
             # 实际归属，确保相同 thread_id 不能被另一个用户复用。
             cursor.execute(
                 """
-                INSERT IGNORE INTO chat_threads (thread_id, user_id, title)
+                INSERT INTO chat_threads (thread_id, user_id, title)
                 VALUES (%s, %s, %s)
+                ON CONFLICT (thread_id) DO NOTHING
                 """,
                 (thread_id, user_id, title),
             )
@@ -153,6 +176,36 @@ def ensure_thread_owner(
         )
 
 
+def verify_thread_owner(
+    thread_id: str,
+    user_id: str,
+    *,
+    allow_missing: bool = False,
+    uri: str | None = None,
+) -> bool:
+    """验证会话归属；允许缺失时返回 False，避免只读接口产生新会话。"""
+
+    with connect_application_database(uri) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT user_id
+                FROM chat_threads
+                WHERE thread_id = %s AND status = 'active'
+                """,
+                (thread_id,),
+            )
+            row = cursor.fetchone()
+
+    if row is None and allow_missing:
+        return False
+    if row is None or row["user_id"] != user_id:
+        raise ThreadOwnershipError(
+            f"Thread {thread_id!r} does not belong to user {user_id!r}"
+        )
+    return True
+
+
 def touch_thread(
     thread_id: str,
     user_id: str,
@@ -163,16 +216,17 @@ def touch_thread(
 
     with connect_application_database(uri) as connection:
         with connection.cursor() as cursor:
-            affected_rows = cursor.execute(
+            cursor.execute(
                 """
                 UPDATE chat_threads
-                SET updated_at = CURRENT_TIMESTAMP(6)
+                SET updated_at = CURRENT_TIMESTAMP
                 WHERE thread_id = %s
                   AND user_id = %s
                   AND status = 'active'
                 """,
                 (thread_id, user_id),
             )
+            affected_rows = cursor.rowcount
 
     if affected_rows != 1:
         raise ThreadOwnershipError(
@@ -211,13 +265,14 @@ def delete_thread_record(
 
     with connect_application_database(uri) as connection:
         with connection.cursor() as cursor:
-            affected_rows = cursor.execute(
+            cursor.execute(
                 """
                 DELETE FROM chat_threads
                 WHERE thread_id = %s AND user_id = %s
                 """,
                 (thread_id, user_id),
             )
+            affected_rows = cursor.rowcount
 
     if affected_rows != 1:
         raise ThreadOwnershipError(
@@ -232,7 +287,7 @@ def main() -> None:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="创建或升级 MySQL 检查点表和 chat_threads 表。",
+        help="创建或升级 PostgreSQL Checkpointer、Store 和 chat_threads 表。",
     )
     args = parser.parse_args()
 
@@ -240,7 +295,7 @@ def main() -> None:
         parser.error("未指定操作，请使用 --setup")
 
     setup_database()
-    print("MySQL 检查点表和会话登记表已准备完成。")
+    print("PostgreSQL Checkpointer、Store 和会话登记表已准备完成。")
 
 
 if __name__ == "__main__":

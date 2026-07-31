@@ -1,16 +1,32 @@
 """FastAPI 服务：提供聊天 API、状态 API，并托管原生前端静态文件。"""
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 
-from store import AppContext, agent, checkpointer, embedding_backend, memory_store
+from persistence import (
+    ThreadOwnershipError,
+    delete_thread_record,
+    ensure_thread_owner,
+    list_user_threads,
+    open_postgres_resources,
+    touch_thread,
+    verify_thread_owner,
+)
+from store import (
+    AppContext,
+    create_app_agent,
+    get_embedding_backend,
+    seed_store,
+)
 
 
 # 配置后端日志，异常时可以在终端中看到完整调用栈。
@@ -21,8 +37,27 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+    """让 PostgreSQL 资源与 FastAPI 应用使用相同的生命周期。"""
+
+    # 两条数据库连接在整个服务运行期间保持可用，退出时由上下文管理器可靠关闭。
+    with open_postgres_resources() as (checkpointer, postgres_store):
+        # 演示用户使用相同 namespace + key 幂等写入，不会覆盖其他用户偏好。
+        seed_store(postgres_store)
+        fastapi_app.state.checkpointer = checkpointer
+        fastapi_app.state.store = postgres_store
+        fastapi_app.state.agent = create_app_agent(checkpointer, postgres_store)
+        yield
+
+
 # 创建 Web 应用，并把 /static 路径映射到本地静态资源目录。
-app = FastAPI(title="Agent Memory Console", version="1.0.0")
+app = FastAPI(
+    title="Agent Memory Console",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -39,6 +74,7 @@ class ResetRequest(BaseModel):
     """清空某个会话 checkpoint 时使用的请求结构。"""
 
     thread_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
 
 
 def content_to_text(content: Any) -> str:
@@ -139,27 +175,49 @@ def health() -> dict[str, str]:
     return {
         "status": "ok",
         "model": "deepseek-v4-pro",
-        "embedding": embedding_backend,
+        "embedding": get_embedding_backend(),
+        "persistence": "postgresql",
     }
 
 
 @app.get("/api/state")
-def get_state(thread_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
+def get_state(
+    http_request: Request,
+    thread_id: str = Query(min_length=1, max_length=128),
+    user_id: str = Query(min_length=1, max_length=128),
+) -> dict[str, Any]:
     """根据 thread_id 读取该会话的最新 checkpoint 状态。"""
+
+    try:
+        # 只读查询不创建 chat_threads 记录；新会话还不存在时直接返回空状态。
+        exists = verify_thread_owner(thread_id, user_id, allow_missing=True)
+        if not exists:
+            return state_payload({})
+    except ThreadOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # checkpointer 使用 configurable.thread_id 定位对应的状态历史。
     config = {"configurable": {"thread_id": thread_id}}
+    agent = http_request.app.state.agent
     snapshot = agent.get_state(config)
     return state_payload(snapshot.values if snapshot else {})
 
 
 @app.post("/api/chat")
-def chat(request: ChatRequest) -> dict[str, Any]:
+def chat(request: ChatRequest, http_request: Request) -> dict[str, Any]:
     """执行一轮 Agent 对话，并返回本轮事件及更新后的状态摘要。"""
 
     config = {"configurable": {"thread_id": request.thread_id}}
+    agent = http_request.app.state.agent
 
     try:
+        # 首次消息登记 thread 归属；已有 thread 必须由同一个 user_id 继续访问。
+        ensure_thread_owner(
+            request.thread_id,
+            request.user_id,
+            title=request.message[:80],
+        )
+
         # 调用前先读取历史消息数量，之后只把本轮新增消息发给前端。
         before = agent.get_state(config)
         previous_count = len(before.values.get("messages", [])) if before else 0
@@ -172,6 +230,7 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         )
         # 使用切片排除 checkpoint 中之前已经展示过的历史消息。
         new_messages = result["messages"][previous_count:]
+        touch_thread(request.thread_id, request.user_id)
 
         # FastAPI 会把下面的普通字典转换为 application/json 响应。
         return {
@@ -180,6 +239,8 @@ def chat(request: ChatRequest) -> dict[str, Any]:
             "thread_id": request.thread_id,
             "user_id": request.user_id,
         }
+    except ThreadOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
         # 服务端记录完整堆栈；同时向浏览器返回可识别的 HTTP 500。
         logger.exception("Agent request failed")
@@ -187,25 +248,39 @@ def chat(request: ChatRequest) -> dict[str, Any]:
 
 
 @app.post("/api/reset")
-def reset_thread(request: ResetRequest) -> dict[str, str]:
-    """删除指定 thread 的全部内存 checkpoint。"""
+def reset_thread(request: ResetRequest, http_request: Request) -> dict[str, str]:
+    """删除指定 thread 的全部 PostgreSQL checkpoint 和应用会话记录。"""
 
-    checkpointer.delete_thread(request.thread_id)
-    return {"status": "reset", "thread_id": request.thread_id}
+    try:
+        verify_thread_owner(request.thread_id, request.user_id)
+        http_request.app.state.checkpointer.delete_thread(request.thread_id)
+        delete_thread_record(request.thread_id, request.user_id)
+        return {"status": "reset", "thread_id": request.thread_id}
+    except ThreadOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.get("/api/users")
-def list_users() -> dict[str, list[dict[str, Any]]]:
+def list_users(http_request: Request) -> dict[str, list[dict[str, Any]]]:
     """列出演示 Store 中的用户资料，主要用于调试。"""
 
     # 不传 query 时按 namespace 获取数据，而不是执行语义相似度查询。
-    items = memory_store.search(("users",), limit=20)
+    items = http_request.app.state.store.search(("users",), limit=20)
     return {"users": [item.value for item in items]}
+
+
+@app.get("/api/threads")
+def list_threads(
+    user_id: str = Query(min_length=1, max_length=128),
+) -> dict[str, list[dict[str, Any]]]:
+    """列出指定用户拥有的有效会话。"""
+
+    return {"threads": list_user_threads(user_id)}
 
 
 # 直接调试 app.py 时启动 Uvicorn；通过 uvicorn app:app 启动时不会重复执行。
 if __name__ == "__main__":
     import uvicorn
 
-    # reload=False 避免开发重载创建两份内存 Store 和 Checkpointer。
+    # reload=False 避免开发重载同时创建两组数据库连接和 Agent。
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
