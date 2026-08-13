@@ -16,9 +16,27 @@
 - `state.py`：自定义 Agent State、`Command` 状态更新和最小状态示例。
 - `store.py`：模型、工具、长期 Store、Embedding 和 Agent 工厂。
 - `persistence.py`：PostgreSQL Checkpointer、Store、数据库初始化和会话登记。
+- `coding_assistant/`：M1 只读编程助手领域包；模型、工具和持久化依赖均由调用方注入，导入包时不得连接外部资源。
+- `M1_READONLY_CODING_ASSISTANT_PLAN.md`：M1 的架构、安全边界、测试评测方案、实施阶段和进度台账。
 - `static/`：用于观察对话、工具调用和状态变化的原生前端。
-- `tests/`：工具、持久化、thread 隔离和 API 失败路径测试。
+- `tests/`：现有持久化/API 测试，以及 `tests/coding_assistant/` 中不依赖网络和 PostgreSQL 的编程助手测试。
 - `test.py`：早期模型直连实验，不作为正式自动化测试入口。
+
+## 编程助手迁移状态
+
+当前可运行入口仍是下文介绍的企业信息与记忆演示；新的编程助手处于 M1 headless 实验阶段，尚未接入 FastAPI 和前端。旧演示不构成兼容性约束，后续按目标架构逐步重写或移除。
+
+首个开发切片对现有代码的处置如下：
+
+| 范围 | 当前处置 | 判断依据 |
+|---|---|---|
+| `app.py`、`static/` | 暂缓 | M1 先验证无 UI 的模型注入和离线工具循环，后续再替换运行入口。 |
+| `state.py` | 暂缓 | 当前状态字段服务于旧演示，待正式编程任务 State 确定后再决定重写或移除。 |
+| `store.py` | 暂缓且禁止新代码依赖 | 文件包含旧业务工具、模块级真实模型和 Embedding 初始化，不适合作为新编程助手基础。 |
+| `persistence.py` | 保留候选 | PostgreSQL 生命周期可能复用，但首个 fake 实验使用 `InMemorySaver`，不连接数据库。 |
+| 现有测试 | 暂时保留 | 旧入口尚未退出；后续删除旧业务时再按准确文件范围处理。 |
+
+M1 新目录和职责已经在本节确定。实施代码不得为旧业务维持双轨兼容，也不得在模块导入期间创建真实模型、读取密钥或探测外部服务。
 
 ## 配置
 
